@@ -1,0 +1,11 @@
+# Data
+data/
+logs/
+reports/
+
+# Python
+__pycache__/
+*.pyc
+
+# System
+.DS_Store
