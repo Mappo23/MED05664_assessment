@@ -1,0 +1,50 @@
+har:
+  target_sampling_hz: 20
+  channels:
+    - acc_x
+    - acc_y
+    - acc_z
+    - gyro_x
+    - gyro_y
+    - gyro_z
+
+  cleaning:
+    interpolate_short_gaps: true
+    lowpass_hz: 8.0
+    standardization: per_recording_zscore
+    dtype: float32
+
+  outputs:
+    pretrain:
+      window_sec: 10.0
+      overlap: 0.0
+      include_labels: false
+    supervised:
+      window_sec: 5.0
+      overlap: 0.5
+      include_labels: true
+
+  labels:
+    sitting: 0
+    standing: 1
+    walking: 2
+    upstairs: 3
+    downstairs: 4
+    jogging_or_running: 5
+
+  pamap2:
+    sensor: wrist
+    exclude_raw_labels: [0, 1, 6, 16, 18, 19, 20, 24]
+    map:
+      2: sitting
+      3: standing
+      4: walking
+      5: jogging_or_running
+      9: sitting
+      10: sitting
+      11: sitting
+      12: upstairs
+      13: downstairs
+
+  wisdm:
+    sensor: watch
