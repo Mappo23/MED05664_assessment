@@ -30,23 +30,63 @@ echo "[INFO] Project root: ${PROJECT_ROOT}"
 download_file() {
   local url="$1"
   local out="$2"
+  local tmp="${out}.part"
 
+  # If final file exists, validate it before trusting it
   if [[ -f "${out}" ]]; then
-    echo "[INFO] Already exists, skipping download: ${out}"
-    return 0
+    if unzip -tq "${out}" >/dev/null 2>&1; then
+      echo "[INFO] Valid archive already exists, skipping download: ${out}"
+      return 0
+    else
+      echo "[WARN] Existing file is invalid, removing: ${out}"
+      rm -f "${out}"
+    fi
   fi
 
+  rm -f "${tmp}"
+
   echo "[INFO] Downloading: ${url}"
-  curl -L --fail --retry 5 --retry-delay 5 -o "${out}" "${url}"
+  curl -L --fail --retry 5 --retry-delay 5 --output "${tmp}" "${url}"
+
+  # Validate before promoting to final filename
+  if unzip -tq "${tmp}" >/dev/null 2>&1; then
+    mv "${tmp}" "${out}"
+    echo "[INFO] Download validated: ${out}"
+  else
+    echo "[ERROR] Downloaded file is not a valid ZIP: ${tmp}"
+    file "${tmp}" || true
+    rm -f "${tmp}"
+    return 1
+  fi
 }
 
 extract_zip() {
   local zip_file="$1"
   local target_dir="$2"
+  local marker="${target_dir}/.extract_done"
 
+  if [[ -f "${marker}" ]]; then
+    echo "[INFO] Extraction already completed, skipping: ${target_dir}"
+    return 0
+  fi
+
+  if ! unzip -tq "${zip_file}" >/dev/null 2>&1; then
+    echo "[ERROR] Invalid ZIP archive: ${zip_file}"
+    file "${zip_file}" || true
+    return 1
+  fi
+
+  rm -rf "${target_dir}"
   mkdir -p "${target_dir}"
+
   echo "[INFO] Extracting ${zip_file} -> ${target_dir}"
-  unzip -o "${zip_file}" -d "${target_dir}" >/dev/null
+  if unzip -o "${zip_file}" -d "${target_dir}" >/dev/null; then
+    touch "${marker}"
+  else
+    echo "[ERROR] Extraction failed, cleaning partial output: ${target_dir}"
+    rm -rf "${target_dir}"
+    return 1
+  fi
 }
 
 write_sha256_manifest() {
