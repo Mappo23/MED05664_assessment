@@ -60,6 +60,12 @@ download_file() {
   fi
 }
 
+cleanup_extraction_markers() {
+  local target_dir="$1"
+
+  find "${target_dir}" -type f -name ".extract_done" -delete
+}
+
 extract_zip() {
   local zip_file="$1"
   local target_dir="$2"
@@ -78,9 +84,11 @@ extract_zip() {
 
   rm -rf "${target_dir}"
   mkdir -p "${target_dir}"
+  cleanup_extraction_markers "${target_dir}"
 
   echo "[INFO] Extracting ${zip_file} -> ${target_dir}"
   if unzip -o "${zip_file}" -d "${target_dir}" >/dev/null; then
+    extract_nested_archives "${target_dir}"
     touch "${marker}"
   else
     echo "[ERROR] Extraction failed, cleaning partial output: ${target_dir}"
@@ -89,12 +97,54 @@ extract_zip() {
   fi
 }
 
+extract_nested_archives() {
+  local target_dir="$1"
+  local changed=1
+  local pass=0
+
+  while [[ ${changed} -eq 1 ]]; do
+    changed=0
+    pass=$((pass + 1))
+
+    while IFS= read -r -d '' archive; do
+      local archive_dir
+      local archive_name
+      local base_name
+      local dest_dir
+      local marker
+
+      archive_dir="$(dirname "${archive}")"
+      archive_name="$(basename "${archive}")"
+      base_name="${archive_name%.*}"
+      dest_dir="${archive_dir}/${base_name}"
+      marker="${dest_dir}/.extract_done"
+
+      if [[ -f "${marker}" ]]; then
+        echo "[INFO] Nested archive already extracted, skipping: ${archive}"
+        continue
+      fi
+
+      if unzip -tq "${archive}" >/dev/null 2>&1; then
+        echo "[INFO] Extracting nested archive (pass ${pass}): ${archive} -> ${dest_dir}"
+        mkdir -p "${dest_dir}"
+        if unzip -o "${archive}" -d "${dest_dir}" >/dev/null; then
+          touch "${marker}"
+          changed=1
+        else
+          echo "[ERROR] Failed to extract nested archive: ${archive}"
+          return 1
+        fi
+      fi
+    done < <(find "${target_dir}" -type f -name "*.zip" -print0)
+  done
+}
+
 write_sha256_manifest() {
   local target="$1"
   local manifest="$2"
 
   echo "[INFO] Writing SHA256 manifest for ${target}"
-  find "${target}" -type f -print0 | sort -z | xargs -0 sha256sum > "${manifest}"
+  find "${target}" -type f ! -name ".extract_done" -print0 | sort -z | xargs -0 sha256sum > "${manifest}"
 }
 
 # Dataset URLs
@@ -117,6 +167,13 @@ extract_zip "${RAW_DIR}/wisdm.zip"    "${RAW_DIR}/wisdm"
 extract_zip "${RAW_DIR}/mhealth.zip"  "${RAW_DIR}/mhealth"
 extract_zip "${RAW_DIR}/eegmmidb.zip" "${RAW_DIR}/eegmmidb"
 extract_zip "${RAW_DIR}/ptbxl.zip"    "${RAW_DIR}/ptbxl"
+
+echo "[INFO] Verifying extracted dataset contents"
+find "${RAW_DIR}/pamap2" -type f | head -20
+find "${RAW_DIR}/wisdm" -type f | head -20
+find "${RAW_DIR}/mhealth" -type f | head -20
+find "${RAW_DIR}/eegmmidb" -type f | head -20
+find "${RAW_DIR}/ptbxl" -type f | head -20
 
 # Manifests
 write_sha256_manifest "${RAW_DIR}/pamap2"   "${MANIFEST_DIR}/pamap2_sha256.txt"
