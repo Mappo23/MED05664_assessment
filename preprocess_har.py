@@ -4,8 +4,10 @@ import json
 import re
 from pathlib import Path, PurePath
 
+import numpy as np
 import pandas as pd
 import yaml
+from scipy import signal
 
 HAR_DATASETS = ["pamap2", "wisdm"]
 
@@ -55,6 +57,27 @@ PAMAP2_ACTIVITY_MAP = {
     24: "rope_jumping",
 }
 
+HAR_CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
+DEFAULT_HAR_CFG = {
+    "target_sampling_hz": 20,
+    "cleaning": {
+        "lowpass_hz": 8.0,
+    },
+    "windowing": {
+        "pretrain": {
+            "window_sec": 10.0,
+            "overlap": 0.0,
+            "include_labels": False,
+        },
+        "supervised": {
+            "window_sec": 5.0,
+            "overlap": 0.5,
+            "include_labels": True,
+            "min_label_purity": 0.8,
+        },
+    },
+}
+
 
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
@@ -71,52 +94,259 @@ def write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, indent=2)
 
 
-def parse_pamap2_subject_id(path: Path) -> str:
-    m = re.search(r"subject(\d+)", path.stem.lower())
-    return f"subject{m.group(1)}" if m else path.stem
+def write_npz(path: Path, **payload) -> None:
+    ensure_dir(path.parent)
+    np.savez_compressed(path, **payload)
 
 
-def parse_pamap2_source_record_id(path: Path) -> str:
-    return path.stem
+def get_har_config(cfg: dict) -> dict:
+    har_cfg = cfg.get("har", {}) if isinstance(cfg, dict) else {}
+    merged = {
+        "target_sampling_hz": har_cfg.get("target_sampling_hz", DEFAULT_HAR_CFG["target_sampling_hz"]),
+        "cleaning": {
+            "lowpass_hz": har_cfg.get("cleaning", {}).get(
+                "lowpass_hz", DEFAULT_HAR_CFG["cleaning"]["lowpass_hz"]
+            ),
+        },
+        "windowing": {
+            "pretrain": {
+                "window_sec": har_cfg.get("windowing", {}).get("pretrain", {}).get(
+                    "window_sec", DEFAULT_HAR_CFG["windowing"]["pretrain"]["window_sec"]
+                ),
+                "overlap": har_cfg.get("windowing", {}).get("pretrain", {}).get(
+                    "overlap", DEFAULT_HAR_CFG["windowing"]["pretrain"]["overlap"]
+                ),
+                "include_labels": False,
+            },
+            "supervised": {
+                "window_sec": har_cfg.get("windowing", {}).get("supervised", {}).get(
+                    "window_sec", DEFAULT_HAR_CFG["windowing"]["supervised"]["window_sec"]
+                ),
+                "overlap": har_cfg.get("windowing", {}).get("supervised", {}).get(
+                    "overlap", DEFAULT_HAR_CFG["windowing"]["supervised"]["overlap"]
+                ),
+                "include_labels": True,
+                "min_label_purity": har_cfg.get("windowing", {}).get("supervised", {}).get(
+                    "min_label_purity", DEFAULT_HAR_CFG["windowing"]["supervised"]["min_label_purity"]
+                ),
+            },
+        },
+    }
+    return merged
 
 
-def is_pamap2_protocol_file(path: Path) -> bool:
-    return "protocol" in {part.lower() for part in path.parts}
+def infer_time_scale_seconds(timestamp_series: pd.Series) -> float:
+    ts = pd.to_numeric(timestamp_series, errors="coerce").dropna().to_numpy(dtype=np.float64)
+    if ts.size < 2:
+        return 1.0
+
+    diffs = np.diff(ts)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return 1.0
+
+    median_dt = float(np.median(diffs))
+    if median_dt > 1e8:
+        return 1e9
+    if median_dt > 1e5:
+        return 1e6
+    if median_dt > 1e2:
+        return 1e3
+    return 1.0
 
 
-def make_pamap2_output_name(path: Path) -> str:
+def build_relative_time_seconds(df: pd.DataFrame) -> np.ndarray:
+    ts = pd.to_numeric(df["timestamp"], errors="coerce").to_numpy(dtype=np.float64)
+    scale = infer_time_scale_seconds(df["timestamp"])
+    ts = ts / scale
+    valid = np.isfinite(ts)
+    if not valid.any():
+        return np.arange(len(df), dtype=np.float64)
+    first_valid = ts[valid][0]
+    ts = ts - first_valid
+    return ts
+
+
+def estimate_sampling_rate_hz(time_sec: np.ndarray) -> float:
+    diffs = np.diff(time_sec)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return np.nan
+    return float(1.0 / np.median(diffs))
+
+
+def maybe_lowpass_filter(values: np.ndarray, source_hz: float, cutoff_hz: float) -> np.ndarray:
+    if not np.isfinite(source_hz) or source_hz <= 0:
+        return values
+    if values.shape[0] < 16:
+        return values
+    nyquist = 0.5 * source_hz
+    if cutoff_hz >= nyquist:
+        return values
+
+    b, a = signal.butter(4, cutoff_hz / nyquist, btype="low")
+    try:
+        return signal.filtfilt(b, a, values, axis=0)
+    except ValueError:
+        return values
+
+
+def interpolate_numeric_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out[columns] = out[columns].interpolate(method="linear", limit_direction="both")
+    return out
+
+
+def robust_channel_standardize(values: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    median = np.nanmedian(values, axis=0, keepdims=True)
+    mad = np.nanmedian(np.abs(values - median), axis=0, keepdims=True)
+    return ((values - median) / (1.4826 * mad + eps)).astype(np.float32)
+
+
+def resample_labels_nearest(time_old: np.ndarray, labels: np.ndarray, time_new: np.ndarray) -> np.ndarray:
+    labels = np.asarray(labels, dtype=object)
+    if labels.size == 0:
+        return np.array([], dtype=object)
+
+    idx = np.searchsorted(time_old, time_new, side="left")
+    idx = np.clip(idx, 0, len(time_old) - 1)
+
+    left_idx = np.clip(idx - 1, 0, len(time_old) - 1)
+    right_idx = idx
+    choose_left = np.abs(time_new - time_old[left_idx]) <= np.abs(time_old[right_idx] - time_new)
+    nearest_idx = np.where(choose_left, left_idx, right_idx)
+    return labels[nearest_idx]
+
+
+def clean_and_resample_frame(df: pd.DataFrame, target_hz: int, lowpass_hz: float) -> tuple[pd.DataFrame, dict]:
+    work = df.copy()
+    work = work.sort_values(["subject_id", "timestamp", "row_idx"]).reset_index(drop=True)
+    work = interpolate_numeric_frame(work, HAR_CHANNELS)
+
+    time_sec = build_relative_time_seconds(work)
+    source_hz = estimate_sampling_rate_hz(time_sec)
+
+    values = work[HAR_CHANNELS].to_numpy(dtype=np.float64)
+    values = maybe_lowpass_filter(values, source_hz=source_hz, cutoff_hz=lowpass_hz)
+
+    if len(time_sec) < 2:
+        raise ValueError("Not enough samples for resampling")
+
+    duration = time_sec[-1]
+    if not np.isfinite(duration) or duration <= 0:
+        raise ValueError("Invalid duration for resampling")
+
+    step = 1.0 / target_hz
+    time_new = np.arange(0.0, duration + 1e-9, step, dtype=np.float64)
+    if time_new.size < 2:
+        raise ValueError("Resampled timeline too short")
+
+    resampled = np.column_stack([
+        np.interp(time_new, time_sec, values[:, i]) for i in range(values.shape[1])
+    ])
+    resampled = robust_channel_standardize(resampled)
+
+    label_names = resample_labels_nearest(time_sec, work["raw_label_name"].astype(object).to_numpy(), time_new)
+    raw_labels = resample_labels_nearest(time_sec, work["raw_label"].astype(object).to_numpy(), time_new)
+
+    out = pd.DataFrame({
+        "time_sec": time_new,
+        "dataset": work["dataset"].iloc[0],
+        "subject_id": work["subject_id"].iloc[0],
+        "source_file": work["source_file"].iloc[0],
+        "source_record_id": work["source_record_id"].iloc[0],
+        "acc_x": resampled[:, 0],
+        "acc_y": resampled[:, 1],
+        "acc_z": resampled[:, 2],
+        "gyro_x": resampled[:, 3],
+        "gyro_y": resampled[:, 4],
+        "gyro_z": resampled[:, 5],
+        "raw_label": list(raw_labels),
+        "raw_label_name": list(label_names),
+    })
+    out["row_idx"] = range(len(out))
+
+    stats = {
+        "source_hz_estimated": None if not np.isfinite(source_hz) else float(source_hz),
+        "target_hz": int(target_hz),
+        "n_input_rows": int(len(df)),
+        "n_output_rows": int(len(out)),
+        "nan_fraction_before_interp": float(df[HAR_CHANNELS].isna().mean().mean()),
+    }
+    return out, stats
+
+
+def make_cleaned_output_name(path: Path) -> str:
     return f"{path.stem}.parquet"
 
 
-def parse_pamap2_file(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(
-        path,
-        sep=r"\s+",
-        header=None,
-        names=PAMAP2_COLUMNS,
-        na_values=["NaN"],
-        engine="python",
-    )
+def compute_window_label(labels: np.ndarray, min_label_purity: float) -> tuple[object, float] | tuple[None, float]:
+    labels = pd.Series(labels, dtype="object")
+    labels = labels.dropna()
+    labels = labels[labels.astype(str).str.strip() != ""]
+    if labels.empty:
+        return None, 0.0
 
-    out = pd.DataFrame({
-        "timestamp": pd.to_numeric(df["timestamp"], errors="coerce"),
-        "dataset": "pamap2",
-        "subject_id": parse_pamap2_subject_id(path),
-        "source_file": str(path),
-        "source_record_id": parse_pamap2_source_record_id(path),
-        # use wrist/hand IMU as common watch/wrist proxy
-        "acc_x": pd.to_numeric(df["hand_acc_16g_x"], errors="coerce"),
-        "acc_y": pd.to_numeric(df["hand_acc_16g_y"], errors="coerce"),
-        "acc_z": pd.to_numeric(df["hand_acc_16g_z"], errors="coerce"),
-        "gyro_x": pd.to_numeric(df["hand_gyro_x"], errors="coerce"),
-        "gyro_y": pd.to_numeric(df["hand_gyro_y"], errors="coerce"),
-        "gyro_z": pd.to_numeric(df["hand_gyro_z"], errors="coerce"),
-        "raw_label": pd.to_numeric(df["activity_id"], errors="coerce").astype("Int64"),
-    })
+    counts = labels.value_counts()
+    label = counts.index[0]
+    purity = float(counts.iloc[0] / counts.sum())
+    if purity < min_label_purity:
+        return None, purity
+    return label, purity
 
-    out["raw_label_name"] = out["raw_label"].map(PAMAP2_ACTIVITY_MAP)
-    out["row_idx"] = range(len(out))
-    return out
+
+def build_windows_from_cleaned_frame(
+    df: pd.DataFrame,
+    window_sec: float,
+    overlap: float,
+    include_labels: bool,
+    sampling_hz: int,
+    min_label_purity: float,
+) -> tuple[np.ndarray, list[dict]]:
+    window_size = int(round(window_sec * sampling_hz))
+    stride = int(round(window_size * (1.0 - overlap)))
+    if stride <= 0:
+        raise ValueError("Window stride must be positive")
+
+    values = df[HAR_CHANNELS].to_numpy(dtype=np.float32)
+    labels = df["raw_label_name"].astype(object).to_numpy()
+    meta = []
+    windows = []
+
+    for start in range(0, len(df) - window_size + 1, stride):
+        end = start + window_size
+        window = values[start:end]
+        if window.shape[0] != window_size:
+            continue
+
+        label_value = None
+        label_purity = None
+        if include_labels:
+            label_value, label_purity = compute_window_label(labels[start:end], min_label_purity=min_label_purity)
+            if label_value is None:
+                continue
+
+        windows.append(window)
+        meta.append({
+            "dataset": df["dataset"].iloc[0],
+            "subject_id": df["subject_id"].iloc[0],
+            "source_file": df["source_file"].iloc[0],
+            "source_record_id": df["source_record_id"].iloc[0],
+            "start_idx": int(start),
+            "end_idx": int(end),
+            "start_time_sec": float(df["time_sec"].iloc[start]),
+            "end_time_sec": float(df["time_sec"].iloc[end - 1]),
+            "sampling_hz": int(sampling_hz),
+            "window_sec": float(window_sec),
+            "label_name": None if label_value is None else str(label_value),
+            "label_purity": None if label_purity is None else float(label_purity),
+        })
+
+    if not windows:
+        return np.empty((0, window_size, len(HAR_CHANNELS)), dtype=np.float32), meta
+    return np.stack(windows).astype(np.float32), meta
 
 
 def discover_wisdm_sensor_files(wisdm_root: Path) -> dict:
@@ -331,26 +561,198 @@ def parse_all_wisdm(raw_root: Path, out_root: Path) -> dict:
     return summary
 
 
+def clean_all_har_dataset(dataset: str, cfg: dict, interim_root: Path) -> dict:
+    har_cfg = get_har_config(cfg)
+    parsed_root = interim_root / dataset / "parsed"
+    cleaned_root = interim_root / dataset / "cleaned"
+    ensure_dir(cleaned_root)
+
+    parsed_files = sorted(parsed_root.glob("*.parquet"))
+    summary = {
+        "dataset": dataset,
+        "stage": "clean_resample",
+        "target_hz": har_cfg["target_sampling_hz"],
+        "n_inputs": len(parsed_files),
+        "n_outputs": 0,
+        "outputs": [],
+        "records": [],
+    }
+
+    for path in parsed_files:
+        df = pd.read_parquet(path)
+        try:
+            cleaned_df, stats = clean_and_resample_frame(
+                df,
+                target_hz=har_cfg["target_sampling_hz"],
+                lowpass_hz=har_cfg["cleaning"]["lowpass_hz"],
+            )
+        except Exception as e:
+            print(f"[WARN] Failed cleaning {path.name}: {e}")
+            continue
+
+        out_path = cleaned_root / make_cleaned_output_name(path)
+        cleaned_df.to_parquet(out_path, index=False)
+
+        summary["n_outputs"] += 1
+        summary["outputs"].append(str(out_path))
+        summary["records"].append({"file": str(path), **stats})
+
+    write_json(cleaned_root / "summary.json", summary)
+    return summary
+
+
+def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processed_root: Path) -> dict:
+    har_cfg = get_har_config(cfg)
+    cleaned_root = interim_root / dataset / "cleaned"
+    cleaned_files = sorted(cleaned_root.glob("*.parquet"))
+
+    pretrain_root = processed_root / "har" / "pretrain" / dataset
+    supervised_root = processed_root / "har" / "supervised" / dataset
+    ensure_dir(pretrain_root)
+    ensure_dir(supervised_root)
+
+    summary = {
+        "dataset": dataset,
+        "stage": "window",
+        "n_inputs": len(cleaned_files),
+        "pretrain_outputs": [],
+        "supervised_outputs": [],
+    }
+
+    for path in cleaned_files:
+        df = pd.read_parquet(path)
+
+        X_pre, meta_pre = build_windows_from_cleaned_frame(
+            df,
+            window_sec=har_cfg["windowing"]["pretrain"]["window_sec"],
+            overlap=har_cfg["windowing"]["pretrain"]["overlap"],
+            include_labels=False,
+            sampling_hz=har_cfg["target_sampling_hz"],
+            min_label_purity=0.0,
+        )
+        pre_out = pretrain_root / f"{path.stem}.npz"
+        write_npz(
+            pre_out,
+            X=X_pre,
+            channels=np.array(HAR_CHANNELS, dtype=object),
+            metadata=np.array(meta_pre, dtype=object),
+        )
+        summary["pretrain_outputs"].append({"file": str(pre_out), "n_windows": int(X_pre.shape[0])})
+
+        X_sup, meta_sup = build_windows_from_cleaned_frame(
+            df,
+            window_sec=har_cfg["windowing"]["supervised"]["window_sec"],
+            overlap=har_cfg["windowing"]["supervised"]["overlap"],
+            include_labels=True,
+            sampling_hz=har_cfg["target_sampling_hz"],
+            min_label_purity=har_cfg["windowing"]["supervised"]["min_label_purity"],
+        )
+        sup_out = supervised_root / f"{path.stem}.npz"
+        write_npz(
+            sup_out,
+            X=X_sup,
+            channels=np.array(HAR_CHANNELS, dtype=object),
+            metadata=np.array(meta_sup, dtype=object),
+        )
+        summary["supervised_outputs"].append({"file": str(sup_out), "n_windows": int(X_sup.shape[0])})
+
+    write_json(processed_root / "har" / f"{dataset}_window_summary.json", summary)
+    return summary
+
+
+def run_har_pipeline_for_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root: Path, processed_root: Path) -> list[dict]:
+    summaries = []
+    if dataset == "pamap2":
+        summaries.append(parse_all_pamap2(raw_root, interim_root))
+    elif dataset == "wisdm":
+        summaries.append(parse_all_wisdm(raw_root, interim_root))
+    else:
+        raise ValueError(f"Unsupported HAR dataset: {dataset}")
+
+    summaries.append(clean_all_har_dataset(dataset, cfg, interim_root))
+    summaries.append(window_all_har_dataset(dataset, cfg, interim_root, processed_root))
+    return summaries
+
+
+def parse_pamap2_subject_id(path: Path) -> str:
+    m = re.search(r"subject(\d+)", path.stem.lower())
+    return f"subject{m.group(1)}" if m else path.stem
+
+
+def parse_pamap2_source_record_id(path: Path) -> str:
+    return path.stem
+
+
+def is_pamap2_protocol_file(path: Path) -> bool:
+    return "protocol" in {part.lower() for part in path.parts}
+
+
+def make_pamap2_output_name(path: Path) -> str:
+    return f"{path.stem}.parquet"
+
+
+def parse_pamap2_file(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        names=PAMAP2_COLUMNS,
+        na_values=["NaN"],
+        engine="python",
+    )
+
+    out = pd.DataFrame({
+        "timestamp": pd.to_numeric(df["timestamp"], errors="coerce"),
+        "dataset": "pamap2",
+        "subject_id": parse_pamap2_subject_id(path),
+        "source_file": str(path),
+        "source_record_id": parse_pamap2_source_record_id(path),
+        # use wrist/hand IMU as common watch/wrist proxy
+        "acc_x": pd.to_numeric(df["hand_acc_16g_x"], errors="coerce"),
+        "acc_y": pd.to_numeric(df["hand_acc_16g_y"], errors="coerce"),
+        "acc_z": pd.to_numeric(df["hand_acc_16g_z"], errors="coerce"),
+        "gyro_x": pd.to_numeric(df["hand_gyro_x"], errors="coerce"),
+        "gyro_y": pd.to_numeric(df["hand_gyro_y"], errors="coerce"),
+        "gyro_z": pd.to_numeric(df["hand_gyro_z"], errors="coerce"),
+        "raw_label": pd.to_numeric(df["activity_id"], errors="coerce").astype("Int64"),
+    })
+
+    out["raw_label_name"] = out["raw_label"].map(PAMAP2_ACTIVITY_MAP)
+    out["row_idx"] = range(len(out))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/pipeline.yaml")
     parser.add_argument("--dataset", choices=["pamap2", "wisdm", "all"], default="all")
+    parser.add_argument("--stage", choices=["parse", "clean", "window", "all"], default="all")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     raw_root = Path(cfg["paths"]["raw_dir"])
     interim_root = Path(cfg["paths"]["interim_dir"]) / "har"
+    processed_root = Path(cfg["paths"]["processed_dir"])
     ensure_dir(interim_root)
+    ensure_dir(processed_root / "har")
 
     summaries = []
+    datasets = HAR_DATASETS if args.dataset == "all" else [args.dataset]
 
-    if args.dataset in ("pamap2", "all"):
-        summaries.append(parse_all_pamap2(raw_root, interim_root))
+    for dataset in datasets:
+        if args.stage == "parse":
+            if dataset == "pamap2":
+                summaries.append(parse_all_pamap2(raw_root, interim_root))
+            elif dataset == "wisdm":
+                summaries.append(parse_all_wisdm(raw_root, interim_root))
+        elif args.stage == "clean":
+            summaries.append(clean_all_har_dataset(dataset, cfg, interim_root))
+        elif args.stage == "window":
+            summaries.append(window_all_har_dataset(dataset, cfg, interim_root, processed_root))
+        else:
+            summaries.extend(run_har_pipeline_for_dataset(dataset, cfg, raw_root, interim_root, processed_root))
 
-    if args.dataset in ("wisdm", "all"):
-        summaries.append(parse_all_wisdm(raw_root, interim_root))
-
-    write_json(interim_root / "parse_summary.json", {"summaries": summaries})
+    write_json(interim_root / "pipeline_summary.json", {"summaries": summaries})
     print(json.dumps({"status": "ok", "summaries": summaries}, indent=2))
 
 
