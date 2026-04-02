@@ -1,0 +1,15 @@
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+
+ecg:
+  sampling_rate_hz: 100
+  cleaning:
+    highpass_hz: 0.5
+    lowpass_hz: 45.0
+    normalize: zscore_lead
+  splits:
+    train_folds: [1, 2, 3, 4, 5, 6, 7, 8]
+    val_folds: [9]
+    test_folds: [10]
