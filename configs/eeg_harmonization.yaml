@@ -1,0 +1,39 @@
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  
+eeg:
+  runs: [4, 8, 12]
+  target_sampling_hz: 160
+  window_sec: 4.0
+  event_codes: [T1, T2]
+  channel_selection:
+    - Fc5
+    - Fc3
+    - Fc1
+    - Fcz
+    - Fc2
+    - Fc4
+    - Fc6
+    - C5
+    - C3
+    - C1
+    - Cz
+    - C2
+    - C4
+    - C6
+    - Cp5
+    - Cp3
+    - Cp1
+    - Cpz
+    - Cp2
+    - Cp4
+    - Cp6
+  cleaning:
+    rereference: average
+    bandpass_hz: [8.0, 30.0]
+    notch_hz: 50.0
+    normalize: zscore_channel
+    amplitude_threshold_uv: 200.0
+    flat_threshold_uv: 0.5
