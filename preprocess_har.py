@@ -166,6 +166,48 @@ def build_relative_time_seconds(df: pd.DataFrame) -> np.ndarray:
     ts = ts - first_valid
     return ts
 
+def normalize_discontinuous_time_series(
+    timestamp_series: pd.Series,
+    max_gap_factor: float = 5.0,
+) -> np.ndarray:
+    ts = pd.to_numeric(timestamp_series, errors="coerce").to_numpy(dtype=np.float64)
+    if ts.size == 0:
+        return ts
+
+    valid = np.isfinite(ts)
+    if not valid.any():
+        return np.arange(len(ts), dtype=np.float64)
+
+    ts = ts.copy()
+    first_valid = ts[valid][0]
+    ts[valid] = ts[valid] - first_valid
+
+    if ts.size == 1:
+        ts[0] = 0.0
+        return ts
+
+    diffs = np.diff(ts)
+    positive_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if positive_diffs.size == 0:
+        return np.arange(len(ts), dtype=np.float64)
+
+    nominal_dt = float(np.median(positive_diffs))
+    if not np.isfinite(nominal_dt) or nominal_dt <= 0:
+        return np.arange(len(ts), dtype=np.float64)
+
+    max_allowed_gap = nominal_dt * max_gap_factor
+    adjusted_diffs = diffs.copy()
+
+    invalid_mask = ~np.isfinite(adjusted_diffs) | (adjusted_diffs <= 0)
+    adjusted_diffs[invalid_mask] = nominal_dt
+
+    large_gap_mask = adjusted_diffs > max_allowed_gap
+    adjusted_diffs[large_gap_mask] = nominal_dt
+
+    normalized = np.empty_like(ts)
+    normalized[0] = 0.0
+    normalized[1:] = np.cumsum(adjusted_diffs)
+    return normalized
 
 def estimate_sampling_rate_hz(time_sec: np.ndarray) -> float:
     diffs = np.diff(time_sec)
@@ -444,8 +486,16 @@ def pair_wisdm_watch_streams(accel_path: Path, gyro_path: Path) -> pd.DataFrame:
         suffixes=("_acc", "_gyro"),
     )
 
+    merged = merged.sort_values(["subject_id", "timestamp"]).reset_index(drop=True)
+
+    timestamp_sec = pd.to_numeric(merged["timestamp"], errors="coerce").astype("float64") / 1e9
+    timestamp_sec = pd.Series(
+        normalize_discontinuous_time_series(timestamp_sec, max_gap_factor=5.0),
+        index=merged.index,
+    )
+
     out = pd.DataFrame({
-        "timestamp": merged["timestamp"],
+        "timestamp": timestamp_sec,
         "dataset": "wisdm",
         "subject_id": merged["subject_id"],
         "source_file": f"{accel_path}|{gyro_path}",
@@ -463,7 +513,6 @@ def pair_wisdm_watch_streams(accel_path: Path, gyro_path: Path) -> pd.DataFrame:
     out = out.sort_values(["subject_id", "timestamp"]).reset_index(drop=True)
     out["row_idx"] = range(len(out))
     return out
-
 
 def parse_all_pamap2(raw_root: Path, out_root: Path) -> dict:
     pamap_root = raw_root / "pamap2"
