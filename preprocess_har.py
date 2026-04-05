@@ -9,7 +9,35 @@ import pandas as pd
 import yaml
 from scipy import signal
 
-HAR_DATASETS = ["pamap2", "wisdm"]
+HAR_DATASETS = ["pamap2", "wisdm", "mhealth"]
+
+MHEALTH_COLUMNS = [
+    "chest_acc_x", "chest_acc_y", "chest_acc_z",
+    "ecg_lead_1", "ecg_lead_2",
+    "ankle_acc_x", "ankle_acc_y", "ankle_acc_z",
+    "ankle_gyro_x", "ankle_gyro_y", "ankle_gyro_z",
+    "ankle_mag_x", "ankle_mag_y", "ankle_mag_z",
+    "arm_acc_x", "arm_acc_y", "arm_acc_z",
+    "arm_gyro_x", "arm_gyro_y", "arm_gyro_z",
+    "arm_mag_x", "arm_mag_y", "arm_mag_z",
+    "activity_id",
+]
+
+MHEALTH_ACTIVITY_MAP = {
+    0: "null",
+    1: "standing",
+    2: "sitting",
+    3: "lying",
+    4: "walking",
+    5: "ascending_stairs",
+    6: "waist_bends_forward",
+    7: "frontal_arm_elevation",
+    8: "knees_bending",
+    9: "cycling",
+    10: "jogging",
+    11: "running",
+    12: "jump_front_back",
+}
 
 PAMAP2_COLUMNS = [
     "timestamp",
@@ -621,6 +649,7 @@ def clean_all_har_dataset(dataset: str, cfg: dict, interim_root: Path) -> dict:
         "dataset": dataset,
         "stage": "clean_resample",
         "target_hz": har_cfg["target_sampling_hz"],
+        "channel_schema": HAR_CHANNELS,
         "n_inputs": len(parsed_files),
         "n_outputs": 0,
         "outputs": [],
@@ -663,6 +692,7 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
     summary = {
         "dataset": dataset,
         "stage": "window",
+        "channel_schema": HAR_CHANNELS,
         "n_inputs": len(cleaned_files),
         "pretrain_outputs": [],
         "supervised_outputs": [],
@@ -715,6 +745,8 @@ def run_har_pipeline_for_dataset(dataset: str, cfg: dict, raw_root: Path, interi
         summaries.append(parse_all_pamap2(raw_root, interim_root))
     elif dataset == "wisdm":
         summaries.append(parse_all_wisdm(raw_root, interim_root))
+    elif dataset == "mhealth":
+        summaries.append(parse_all_mhealth(raw_root, interim_root))
     else:
         raise ValueError(f"Unsupported HAR dataset: {dataset}")
 
@@ -722,6 +754,17 @@ def run_har_pipeline_for_dataset(dataset: str, cfg: dict, raw_root: Path, interi
     summaries.append(window_all_har_dataset(dataset, cfg, interim_root, processed_root))
     return summaries
 
+def parse_mhealth_subject_id(path: Path) -> str:
+    m = re.search(r"subject(\d+)", path.stem.lower())
+    return f"subject{m.group(1)}" if m else path.stem
+
+
+def parse_mhealth_source_record_id(path: Path) -> str:
+    return path.stem
+
+
+def make_mhealth_output_name(path: Path) -> str:
+    return f"{path.stem}.parquet"
 
 def parse_pamap2_subject_id(path: Path) -> str:
     m = re.search(r"subject(\d+)", path.stem.lower())
@@ -738,6 +781,74 @@ def is_pamap2_protocol_file(path: Path) -> bool:
 
 def make_pamap2_output_name(path: Path) -> str:
     return f"{path.stem}.parquet"
+
+
+def parse_mhealth_file(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        names=MHEALTH_COLUMNS,
+        na_values=["NaN"],
+        engine="python",
+    )
+
+    timestamp = np.arange(len(df), dtype=np.float64) / 50.0
+
+    out = pd.DataFrame({
+        "timestamp": timestamp,
+        "dataset": "mhealth",
+        "subject_id": parse_mhealth_subject_id(path),
+        "source_file": str(path),
+        "source_record_id": parse_mhealth_source_record_id(path),
+        # use right lower arm IMU as common wrist/watch proxy
+        "acc_x": pd.to_numeric(df["arm_acc_x"], errors="coerce"),
+        "acc_y": pd.to_numeric(df["arm_acc_y"], errors="coerce"),
+        "acc_z": pd.to_numeric(df["arm_acc_z"], errors="coerce"),
+        "gyro_x": pd.to_numeric(df["arm_gyro_x"], errors="coerce"),
+        "gyro_y": pd.to_numeric(df["arm_gyro_y"], errors="coerce"),
+        "gyro_z": pd.to_numeric(df["arm_gyro_z"], errors="coerce"),
+        "raw_label": pd.to_numeric(df["activity_id"], errors="coerce").astype("Int64"),
+    })
+
+    out["raw_label_name"] = out["raw_label"].map(MHEALTH_ACTIVITY_MAP)
+    out["row_idx"] = range(len(out))
+    return out
+
+
+def parse_all_mhealth(raw_root: Path, out_root: Path) -> dict:
+    mhealth_root = raw_root / "mhealth"
+    parsed_root = out_root / "mhealth" / "parsed"
+    ensure_dir(parsed_root)
+
+    log_files = sorted(mhealth_root.rglob("*.log"))
+    summary = {
+        "dataset": "mhealth",
+        "selection": "subject_logs_only",
+        "source_sampling_hz": 50,
+        "shared_sensor_proxy": "right_lower_arm",
+        "null_label_mapping": {
+            "raw_label": 0,
+            "mapped_label_name": "null",
+            "meaning": "background / non-target class kept explicitly documented in parsed outputs",
+        },
+        "n_files": 0,
+        "n_rows_total": 0,
+        "outputs": [],
+    }
+
+    for path in log_files:
+        df = parse_mhealth_file(path)
+
+        out_path = parsed_root / make_mhealth_output_name(path)
+        df.to_parquet(out_path, index=False)
+
+        summary["n_files"] += 1
+        summary["n_rows_total"] += len(df)
+        summary["outputs"].append(str(out_path))
+
+    write_json(parsed_root / "summary.json", summary)
+    return summary
 
 
 def parse_pamap2_file(path: Path) -> pd.DataFrame:
@@ -774,7 +885,7 @@ def parse_pamap2_file(path: Path) -> pd.DataFrame:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/pipeline.yaml")
-    parser.add_argument("--dataset", choices=["pamap2", "wisdm", "all"], default="all")
+    parser.add_argument("--dataset", choices=["pamap2", "wisdm", "mhealth", "all"], default="all")
     parser.add_argument("--stage", choices=["parse", "clean", "window", "all"], default="all")
     args = parser.parse_args()
 
@@ -794,6 +905,8 @@ def main():
                 summaries.append(parse_all_pamap2(raw_root, interim_root))
             elif dataset == "wisdm":
                 summaries.append(parse_all_wisdm(raw_root, interim_root))
+            elif dataset == "mhealth":
+                summaries.append(parse_all_mhealth(raw_root, interim_root))
         elif args.stage == "clean":
             summaries.append(clean_all_har_dataset(dataset, cfg, interim_root))
         elif args.stage == "window":
