@@ -18,6 +18,7 @@ EEG_CHANNELS_DEFAULT = [
     "Cp5", "Cp3", "Cp1", "Cpz", "Cp2", "Cp4", "Cp6",
 ]
 
+
 DEFAULT_EEG_CFG = {
     "runs": [4, 8, 12],
     "target_sampling_hz": 160,
@@ -33,6 +34,99 @@ DEFAULT_EEG_CFG = {
         "flat_threshold_uv": 0.5,
     },
 }
+
+
+CANONICAL_META_COLUMNS = [
+    "sample_id",
+    "dataset_name",
+    "modality",
+    "subject_or_patient_id",
+    "source_file_or_record",
+    "source_record_id",
+    "split",
+    "label_or_event",
+    "sampling_rate_hz",
+    "n_channels",
+    "n_samples",
+    "channel_schema",
+    "qc_flags",
+    "start_time_sec",
+    "end_time_sec",
+    "start_idx",
+    "end_idx",
+]
+
+
+def stable_json_dumps(obj) -> str:
+    return json.dumps(obj, sort_keys=True)
+
+
+def normalize_channel_schema(channels: list[str]) -> str:
+    return stable_json_dumps(list(channels))
+
+
+def normalize_qc_flags(flags=None) -> str:
+    if flags is None:
+        flags = []
+    if isinstance(flags, str):
+        flags = [flags]
+    cleaned = [str(x) for x in flags if x not in (None, "")]
+    return stable_json_dumps(sorted(set(cleaned)))
+
+
+def make_sample_id(
+    dataset_name: str,
+    modality: str,
+    subject_or_patient_id,
+    source_record_id,
+    split: str,
+    index: int,
+) -> str:
+    subject_token = "na" if pd.isna(subject_or_patient_id) else str(subject_or_patient_id)
+    record_token = "na" if pd.isna(source_record_id) else str(source_record_id)
+    split_token = split or "na"
+    return f"{dataset_name}_{modality}_{subject_token}_{record_token}_{split_token}_{index:06d}"
+
+
+def finalize_metadata_row(row: dict) -> dict:
+    out = dict(row)
+    out.setdefault("split", None)
+    out.setdefault("label_or_event", None)
+    out.setdefault("qc_flags", normalize_qc_flags([]))
+    out.setdefault("start_time_sec", None)
+    out.setdefault("end_time_sec", None)
+    out.setdefault("start_idx", None)
+    out.setdefault("end_idx", None)
+    return out
+
+
+def summarize_artifact(
+    path: Path,
+    *,
+    artifact_kind: str,
+    dataset_name: str,
+    modality: str,
+    stage: str,
+    n_samples: int | None = None,
+    array_shape=None,
+    dtype=None,
+    extra: dict | None = None,
+) -> dict:
+    payload = {
+        "dataset_name": dataset_name,
+        "modality": modality,
+        "stage": stage,
+        "artifact_kind": artifact_kind,
+        "path": str(path),
+        "exists": path.exists(),
+        "file_size_bytes": int(path.stat().st_size) if path.exists() else None,
+        "n_samples": n_samples,
+        "array_shape": list(array_shape) if array_shape is not None else None,
+        "dtype": str(dtype) if dtype is not None else None,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def load_config(path: str) -> dict:
@@ -167,19 +261,22 @@ def parse_eegmmidb_file(path: Path, eeg_cfg: dict) -> pd.DataFrame:
 
         rows.append(
             {
-                "dataset": "eegmmidb",
-                "subject_id": subject_id,
+                "dataset_name": "eegmmidb",
+                "modality": "eeg",
+                "subject_or_patient_id": subject_id,
                 "run_id": run_id,
-                "source_file": str(path),
+                "source_file_or_record": str(path),
                 "source_record_id": source_record_id,
                 "annotation_idx": ann_idx,
                 "event_code": event_code,
+                "label_or_event": label_name,
                 "label_name": label_name,
                 "onset_sec": float(ann["onset"]),
                 "duration_sec": float(ann["duration"]),
-                "sampling_hz": sfreq,
-                "n_channels_total": int(len(raw.ch_names)),
-                "channels_total": json.dumps(list(raw.ch_names)),
+                "sampling_rate_hz": sfreq,
+                "n_channels": int(len(raw.ch_names)),
+                "channel_schema": normalize_channel_schema(list(raw.ch_names)),
+                "qc_flags": normalize_qc_flags([]),
             }
         )
 
@@ -330,13 +427,15 @@ def clean_and_epoch_eeg_record(
         if end_idx > raw.n_times:
             rejected_meta.append(
                 {
-                    "dataset": row["dataset"],
-                    "subject_id": row["subject_id"],
+                    "dataset_name": row["dataset_name"],
+                    "modality": "eeg",
+                    "subject_or_patient_id": row["subject_or_patient_id"],
                     "run_id": int(row["run_id"]),
-                    "source_file": row["source_file"],
+                    "source_file_or_record": row["source_file_or_record"],
                     "source_record_id": row["source_record_id"],
                     "annotation_idx": int(row["annotation_idx"]),
                     "event_code": row["event_code"],
+                    "label_or_event": row["label_or_event"],
                     "label_name": row["label_name"],
                     "onset_sec": onset_sec,
                     "reason": "short_tail",
@@ -353,13 +452,15 @@ def clean_and_epoch_eeg_record(
         if reason is not None:
             rejected_meta.append(
                 {
-                    "dataset": row["dataset"],
-                    "subject_id": row["subject_id"],
+                    "dataset_name": row["dataset_name"],
+                    "modality": "eeg",
+                    "subject_or_patient_id": row["subject_or_patient_id"],
                     "run_id": int(row["run_id"]),
-                    "source_file": row["source_file"],
+                    "source_file_or_record": row["source_file_or_record"],
                     "source_record_id": row["source_record_id"],
                     "annotation_idx": int(row["annotation_idx"]),
                     "event_code": row["event_code"],
+                    "label_or_event": row["label_or_event"],
                     "label_name": row["label_name"],
                     "onset_sec": onset_sec,
                     "reason": reason,
@@ -371,13 +472,15 @@ def clean_and_epoch_eeg_record(
         kept_windows.append(values)
         kept_meta.append(
             {
-                "dataset": row["dataset"],
-                "subject_id": row["subject_id"],
+                "dataset_name": row["dataset_name"],
+                "modality": "eeg",
+                "subject_or_patient_id": row["subject_or_patient_id"],
                 "run_id": int(row["run_id"]),
-                "source_file": row["source_file"],
+                "source_file_or_record": row["source_file_or_record"],
                 "source_record_id": row["source_record_id"],
                 "annotation_idx": int(row["annotation_idx"]),
                 "event_code": row["event_code"],
+                "label_or_event": row["label_or_event"],
                 "label_name": row["label_name"],
                 "onset_sec": onset_sec,
                 "window_start_sec": onset_sec,
@@ -385,10 +488,11 @@ def clean_and_epoch_eeg_record(
                 "window_end_sec": onset_sec + float(eeg_cfg["window_sec"]),
                 "start_idx": int(start_idx),
                 "end_idx": int(end_idx),
-                "sampling_hz": int(sampling_hz),
+                "sampling_rate_hz": int(sampling_hz),
                 "n_channels": int(values.shape[0]),
                 "n_samples": int(values.shape[1]),
-                "channels": json.dumps(selected_channels),
+                "channel_schema": normalize_channel_schema(selected_channels),
+                "qc_flags": normalize_qc_flags([]),
             }
         )
 
@@ -406,15 +510,16 @@ def clean_all_eeg_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root:
 
     parsed_files = sorted(parsed_root.glob("*.parquet"))
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "eeg",
         "stage": "clean_event_preprocess",
-        "target_hz": eeg_cfg["target_sampling_hz"],
+        "sampling_rate_hz": eeg_cfg["target_sampling_hz"],
         "window_sec": eeg_cfg["window_sec"],
         "n_inputs": len(parsed_files),
         "n_outputs": 0,
         "n_windows_total": 0,
         "n_rejected_total": 0,
-        "outputs": [],
+        "artifacts": [],
         "records": [],
     }
 
@@ -423,7 +528,7 @@ def clean_all_eeg_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root:
         if event_df.empty:
             continue
 
-        edf_path = Path(event_df["source_file"].iloc[0])
+        edf_path = Path(event_df["source_file_or_record"].iloc[0])
 
         try:
             windows, kept_meta, rejected_meta = clean_and_epoch_eeg_record(
@@ -441,20 +546,56 @@ def clean_all_eeg_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root:
         npy_out = cleaned_root / f"{stem}.npy"
 
         if kept_meta:
-            np.save(npy_out, np.stack(windows).astype(np.float32))
+            X = np.stack(windows).astype(np.float32)
+            np.save(npy_out, X)
             pd.DataFrame(kept_meta).to_parquet(meta_out, index=False)
             summary["n_outputs"] += 1
             summary["n_windows_total"] += len(kept_meta)
-            summary["outputs"].append(str(meta_out))
+            summary["artifacts"].append(
+                summarize_artifact(
+                    meta_out,
+                    artifact_kind="cleaned_metadata_parquet",
+                    dataset_name=dataset,
+                    modality="eeg",
+                    stage="clean_event_preprocess",
+                    n_samples=int(len(kept_meta)),
+                    dtype="float32",
+                    extra={"source_edf": str(edf_path)},
+                )
+            )
+            summary["artifacts"].append(
+                summarize_artifact(
+                    npy_out,
+                    artifact_kind="cleaned_windows_npy",
+                    dataset_name=dataset,
+                    modality="eeg",
+                    stage="clean_event_preprocess",
+                    n_samples=int(len(kept_meta)),
+                    array_shape=list(X.shape),
+                    dtype=X.dtype,
+                    extra={"source_edf": str(edf_path)},
+                )
+            )
         else:
             pd.DataFrame(columns=[
-                "dataset", "subject_id", "run_id", "source_file", "source_record_id",
-                "annotation_idx", "event_code", "label_name", "onset_sec",
-                "duration_sec", "start_idx", "end_idx", "sampling_hz",
-                "n_channels", "n_samples", "channels"
+                "dataset_name", "modality", "subject_or_patient_id", "run_id", "source_file_or_record",
+                "source_record_id", "annotation_idx", "event_code", "label_or_event", "label_name",
+                "onset_sec", "duration_sec", "start_idx", "end_idx", "sampling_rate_hz",
+                "n_channels", "n_samples", "channel_schema", "qc_flags"
             ]).to_parquet(meta_out, index=False)
 
         pd.DataFrame(rejected_meta).to_parquet(rej_out, index=False)
+        summary["artifacts"].append(
+            summarize_artifact(
+                rej_out,
+                artifact_kind="rejections_parquet",
+                dataset_name=dataset,
+                modality="eeg",
+                stage="clean_event_preprocess",
+                n_samples=int(len(rejected_meta)),
+                extra={"source_edf": str(edf_path)},
+            )
+        )        
         summary["n_rejected_total"] += len(rejected_meta)
         summary["records"].append(
             {
@@ -497,10 +638,11 @@ def window_all_eeg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
     ensure_dir(supervised_root)
 
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "eeg",
         "stage": "window",
         "n_inputs": len(cleaned_meta_files),
-        "supervised_outputs": [],
+        "artifacts": [],
     }
 
     for meta_path in cleaned_meta_files:
@@ -518,7 +660,7 @@ def window_all_eeg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
         channel_names = []
         if metadata:
             try:
-                channel_names = json.loads(metadata[0]["channels"])
+                channel_names = json.loads(metadata[0]["channel_schema"])
             except Exception:
                 channel_names = []
 
@@ -528,8 +670,21 @@ def window_all_eeg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             channels=np.array(channel_names, dtype=object),
             metadata=np.array(metadata, dtype=object),
         )
-        summary["supervised_outputs"].append(
-            {"file": str(out_path), "n_windows": int(X.shape[0])}
+        summary["artifacts"].append(
+            summarize_artifact(
+                out_path,
+                artifact_kind="supervised_npz",
+                dataset_name=dataset,
+                modality="eeg",
+                stage="window",
+                n_samples=int(X.shape[0]),
+                array_shape=list(X.shape),
+                dtype=X.dtype,
+                extra={
+                    "split": "supervised",
+                    "channel_schema": normalize_channel_schema(channel_names),
+                },
+            )
         )
 
     write_json(processed_root / "eeg" / f"{dataset}_window_summary.json", summary)

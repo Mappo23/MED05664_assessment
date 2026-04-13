@@ -86,6 +86,7 @@ PAMAP2_ACTIVITY_MAP = {
 }
 
 HAR_CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
+
 DEFAULT_HAR_CFG = {
     "target_sampling_hz": 20,
     "cleaning": {
@@ -105,6 +106,99 @@ DEFAULT_HAR_CFG = {
         },
     },
 }
+
+
+CANONICAL_META_COLUMNS = [
+    "sample_id",
+    "dataset_name",
+    "modality",
+    "subject_or_patient_id",
+    "source_file_or_record",
+    "source_record_id",
+    "split",
+    "label_or_event",
+    "sampling_rate_hz",
+    "n_channels",
+    "n_samples",
+    "channel_schema",
+    "qc_flags",
+    "start_time_sec",
+    "end_time_sec",
+    "start_idx",
+    "end_idx",
+]
+
+
+def stable_json_dumps(obj) -> str:
+    return json.dumps(obj, sort_keys=True)
+
+
+def normalize_channel_schema(channels: list[str]) -> str:
+    return stable_json_dumps(list(channels))
+
+
+def normalize_qc_flags(flags=None) -> str:
+    if flags is None:
+        flags = []
+    if isinstance(flags, str):
+        flags = [flags]
+    cleaned = [str(x) for x in flags if x not in (None, "")]
+    return stable_json_dumps(sorted(set(cleaned)))
+
+
+def make_sample_id(
+    dataset_name: str,
+    modality: str,
+    subject_or_patient_id,
+    source_record_id,
+    split: str,
+    index: int,
+) -> str:
+    subject_token = "na" if pd.isna(subject_or_patient_id) else str(subject_or_patient_id)
+    record_token = "na" if pd.isna(source_record_id) else str(source_record_id)
+    split_token = split or "na"
+    return f"{dataset_name}_{modality}_{subject_token}_{record_token}_{split_token}_{index:06d}"
+
+
+def finalize_metadata_row(row: dict) -> dict:
+    out = dict(row)
+    out.setdefault("split", None)
+    out.setdefault("label_or_event", None)
+    out.setdefault("qc_flags", normalize_qc_flags([]))
+    out.setdefault("start_time_sec", None)
+    out.setdefault("end_time_sec", None)
+    out.setdefault("start_idx", None)
+    out.setdefault("end_idx", None)
+    return out
+
+
+def summarize_artifact(
+    path: Path,
+    *,
+    artifact_kind: str,
+    dataset_name: str,
+    modality: str,
+    stage: str,
+    n_samples: int | None = None,
+    array_shape=None,
+    dtype=None,
+    extra: dict | None = None,
+) -> dict:
+    payload = {
+        "dataset_name": dataset_name,
+        "modality": modality,
+        "stage": stage,
+        "artifact_kind": artifact_kind,
+        "path": str(path),
+        "exists": path.exists(),
+        "file_size_bytes": int(path.stat().st_size) if path.exists() else None,
+        "n_samples": n_samples,
+        "array_shape": list(array_shape) if array_shape is not None else None,
+        "dtype": str(dtype) if dtype is not None else None,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def load_config(path: str) -> dict:
@@ -340,9 +434,12 @@ def clean_and_resample_frame(df: pd.DataFrame, target_hz: int, lowpass_hz: float
 
     stats = {
         "source_hz_estimated": None if not np.isfinite(source_hz) else float(source_hz),
-        "target_hz": int(target_hz),
+        "sampling_rate_hz": int(target_hz),
         "n_input_rows": int(len(df)),
         "n_output_rows": int(len(out)),
+        "n_channels": int(len(HAR_CHANNELS)),
+        "n_samples": int(len(out)),
+        "channel_schema": normalize_channel_schema(HAR_CHANNELS),
         "nan_fraction_before_interp": float(df[HAR_CHANNELS].isna().mean().mean()),
     }
     return out, stats
@@ -382,8 +479,9 @@ def build_windows_from_cleaned_frame(
 
     values = df[HAR_CHANNELS].to_numpy(dtype=np.float32)
     labels = df["raw_label_name"].astype(object).to_numpy()
-    meta = []
+    metadata = []
     windows = []
+    split_name = "supervised" if include_labels else "pretrain"
 
     for start in range(0, len(df) - window_size + 1, stride):
         end = start + window_size
@@ -393,30 +491,53 @@ def build_windows_from_cleaned_frame(
 
         label_value = None
         label_purity = None
+        qc_flags = []
         if include_labels:
-            label_value, label_purity = compute_window_label(labels[start:end], min_label_purity=min_label_purity)
+            label_value, label_purity = compute_window_label(
+                labels[start:end],
+                min_label_purity=min_label_purity,
+            )
             if label_value is None:
                 continue
 
         windows.append(window)
-        meta.append({
-            "dataset": df["dataset"].iloc[0],
-            "subject_id": df["subject_id"].iloc[0],
-            "source_file": df["source_file"].iloc[0],
-            "source_record_id": df["source_record_id"].iloc[0],
-            "start_idx": int(start),
-            "end_idx": int(end),
-            "start_time_sec": float(df["time_sec"].iloc[start]),
-            "end_time_sec": float(df["time_sec"].iloc[end - 1]),
-            "sampling_hz": int(sampling_hz),
-            "window_sec": float(window_sec),
-            "label_name": None if label_value is None else str(label_value),
-            "label_purity": None if label_purity is None else float(label_purity),
-        })
+        metadata.append(
+            finalize_metadata_row(
+                {
+                    "sample_id": make_sample_id(
+                        dataset_name=str(df["dataset"].iloc[0]),
+                        modality="har",
+                        subject_or_patient_id=df["subject_id"].iloc[0],
+                        source_record_id=df["source_record_id"].iloc[0],
+                        split=split_name,
+                        index=len(metadata),
+                    ),
+                    "dataset_name": str(df["dataset"].iloc[0]),
+                    "modality": "har",
+                    "subject_or_patient_id": str(df["subject_id"].iloc[0]),
+                    "source_file_or_record": str(df["source_file"].iloc[0]),
+                    "source_record_id": str(df["source_record_id"].iloc[0]),
+                    "split": split_name,
+                    "label_or_event": None if label_value is None else str(label_value),
+                    "sampling_rate_hz": int(sampling_hz),
+                    "n_channels": int(len(HAR_CHANNELS)),
+                    "n_samples": int(window.shape[0]),
+                    "channel_schema": normalize_channel_schema(HAR_CHANNELS),
+                    "qc_flags": normalize_qc_flags(qc_flags),
+                    "start_time_sec": float(df["time_sec"].iloc[start]),
+                    "end_time_sec": float(df["time_sec"].iloc[end - 1]),
+                    "start_idx": int(start),
+                    "end_idx": int(end),
+                    "window_sec": float(window_sec),
+                    "label_name": None if label_value is None else str(label_value),
+                    "label_purity": None if label_purity is None else float(label_purity),
+                }
+            )
+        )
 
     if not windows:
-        return np.empty((0, window_size, len(HAR_CHANNELS)), dtype=np.float32), meta
-    return np.stack(windows).astype(np.float32), meta
+        return np.empty((0, window_size, len(HAR_CHANNELS)), dtype=np.float32), metadata
+    return np.stack(windows).astype(np.float32), metadata
 
 
 def discover_wisdm_sensor_files(wisdm_root: Path) -> dict:
@@ -646,13 +767,14 @@ def clean_all_har_dataset(dataset: str, cfg: dict, interim_root: Path) -> dict:
 
     parsed_files = sorted(parsed_root.glob("*.parquet"))
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "har",
         "stage": "clean_resample",
-        "target_hz": har_cfg["target_sampling_hz"],
-        "channel_schema": HAR_CHANNELS,
+        "sampling_rate_hz": har_cfg["target_sampling_hz"],
+        "channel_schema": normalize_channel_schema(HAR_CHANNELS),
         "n_inputs": len(parsed_files),
         "n_outputs": 0,
-        "outputs": [],
+        "artifacts": [],
         "records": [],
     }
 
@@ -672,7 +794,22 @@ def clean_all_har_dataset(dataset: str, cfg: dict, interim_root: Path) -> dict:
         cleaned_df.to_parquet(out_path, index=False)
 
         summary["n_outputs"] += 1
-        summary["outputs"].append(str(out_path))
+        summary["artifacts"].append(
+            summarize_artifact(
+                out_path,
+                artifact_kind="cleaned_parquet",
+                dataset_name=dataset,
+                modality="har",
+                stage="clean_resample",
+                n_samples=int(len(cleaned_df)),
+                array_shape=[int(len(cleaned_df)), int(len(HAR_CHANNELS))],
+                dtype="float32",
+                extra={
+                    "source_file": str(path),
+                    "channel_schema": normalize_channel_schema(HAR_CHANNELS),
+                },
+            )
+        )
         summary["records"].append({"file": str(path), **stats})
 
     write_json(cleaned_root / "summary.json", summary)
@@ -690,12 +827,13 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
     ensure_dir(supervised_root)
 
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "har",
         "stage": "window",
-        "channel_schema": HAR_CHANNELS,
+        "sampling_rate_hz": har_cfg["target_sampling_hz"],
+        "channel_schema": normalize_channel_schema(HAR_CHANNELS),
         "n_inputs": len(cleaned_files),
-        "pretrain_outputs": [],
-        "supervised_outputs": [],
+        "artifacts": [],
     }
 
     for path in cleaned_files:
@@ -716,7 +854,22 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             channels=np.array(HAR_CHANNELS, dtype=object),
             metadata=np.array(meta_pre, dtype=object),
         )
-        summary["pretrain_outputs"].append({"file": str(pre_out), "n_windows": int(X_pre.shape[0])})
+        summary["artifacts"].append(
+            summarize_artifact(
+                pre_out,
+                artifact_kind="pretrain_npz",
+                dataset_name=dataset,
+                modality="har",
+                stage="window",
+                n_samples=int(X_pre.shape[0]),
+                array_shape=list(X_pre.shape),
+                dtype=X_pre.dtype,
+                extra={
+                    "split": "pretrain",
+                    "channel_schema": normalize_channel_schema(HAR_CHANNELS),
+                },
+            )
+        )
 
         X_sup, meta_sup = build_windows_from_cleaned_frame(
             df,
@@ -733,7 +886,22 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             channels=np.array(HAR_CHANNELS, dtype=object),
             metadata=np.array(meta_sup, dtype=object),
         )
-        summary["supervised_outputs"].append({"file": str(sup_out), "n_windows": int(X_sup.shape[0])})
+        summary["artifacts"].append(
+            summarize_artifact(
+                sup_out,
+                artifact_kind="supervised_npz",
+                dataset_name=dataset,
+                modality="har",
+                stage="window",
+                n_samples=int(X_sup.shape[0]),
+                array_shape=list(X_sup.shape),
+                dtype=X_sup.dtype,
+                extra={
+                    "split": "supervised",
+                    "channel_schema": normalize_channel_schema(HAR_CHANNELS),
+                },
+            )
+        )
 
     write_json(processed_root / "har" / f"{dataset}_window_summary.json", summary)
     return summary

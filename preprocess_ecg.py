@@ -17,6 +17,7 @@ PTBXL_LEADS = [
     "V1", "V2", "V3", "V4", "V5", "V6",
 ]
 
+
 DEFAULT_ECG_CFG = {
     "sampling_rate_hz": 100,  # PTB-XL supports 100 or 500
     "cleaning": {
@@ -30,6 +31,99 @@ DEFAULT_ECG_CFG = {
         "test_folds": [10],
     },
 }
+
+
+CANONICAL_META_COLUMNS = [
+    "sample_id",
+    "dataset_name",
+    "modality",
+    "subject_or_patient_id",
+    "source_file_or_record",
+    "source_record_id",
+    "split",
+    "label_or_event",
+    "sampling_rate_hz",
+    "n_channels",
+    "n_samples",
+    "channel_schema",
+    "qc_flags",
+    "start_time_sec",
+    "end_time_sec",
+    "start_idx",
+    "end_idx",
+]
+
+
+def stable_json_dumps(obj) -> str:
+    return json.dumps(obj, sort_keys=True)
+
+
+def normalize_channel_schema(channels: list[str]) -> str:
+    return stable_json_dumps(list(channels))
+
+
+def normalize_qc_flags(flags=None) -> str:
+    if flags is None:
+        flags = []
+    if isinstance(flags, str):
+        flags = [flags]
+    cleaned = [str(x) for x in flags if x not in (None, "")]
+    return stable_json_dumps(sorted(set(cleaned)))
+
+
+def make_sample_id(
+    dataset_name: str,
+    modality: str,
+    subject_or_patient_id,
+    source_record_id,
+    split: str,
+    index: int,
+) -> str:
+    subject_token = "na" if pd.isna(subject_or_patient_id) else str(subject_or_patient_id)
+    record_token = "na" if pd.isna(source_record_id) else str(source_record_id)
+    split_token = split or "na"
+    return f"{dataset_name}_{modality}_{subject_token}_{record_token}_{split_token}_{index:06d}"
+
+
+def finalize_metadata_row(row: dict) -> dict:
+    out = dict(row)
+    out.setdefault("split", None)
+    out.setdefault("label_or_event", None)
+    out.setdefault("qc_flags", normalize_qc_flags([]))
+    out.setdefault("start_time_sec", None)
+    out.setdefault("end_time_sec", None)
+    out.setdefault("start_idx", None)
+    out.setdefault("end_idx", None)
+    return out
+
+
+def summarize_artifact(
+    path: Path,
+    *,
+    artifact_kind: str,
+    dataset_name: str,
+    modality: str,
+    stage: str,
+    n_samples: int | None = None,
+    array_shape=None,
+    dtype=None,
+    extra: dict | None = None,
+) -> dict:
+    payload = {
+        "dataset_name": dataset_name,
+        "modality": modality,
+        "stage": stage,
+        "artifact_kind": artifact_kind,
+        "path": str(path),
+        "exists": path.exists(),
+        "file_size_bytes": int(path.stat().st_size) if path.exists() else None,
+        "n_samples": n_samples,
+        "array_shape": list(array_shape) if array_shape is not None else None,
+        "dtype": str(dtype) if dtype is not None else None,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def load_config(path: str) -> dict:
@@ -156,19 +250,34 @@ def load_ptbxl_metadata(raw_root: Path, ecg_cfg: dict) -> pd.DataFrame:
         raise ValueError(f"Missing expected PTB-XL column: {filename_col}")
 
     out = pd.DataFrame({
-        "dataset": "ptbxl",
-        "patient_id": df["patient_id"].astype("Int64"),
-        "record_id": df["ecg_id"].astype("Int64"),
-        "source_file": df[filename_col].astype(str),
+        "dataset_name": "ptbxl",
+        "modality": "ecg",
+        "subject_or_patient_id": df["patient_id"].astype("Int64"),
+        "source_file_or_record": df[filename_col].astype(str),
+        "source_record_id": df["ecg_id"].astype("Int64"),
         "sampling_rate_hz": int(ecg_cfg["sampling_rate_hz"]),
+        "n_channels": len(PTBXL_LEADS),
+        "n_samples": int(10 * int(ecg_cfg["sampling_rate_hz"])),
+        "channel_schema": [normalize_channel_schema(PTBXL_LEADS)] * len(df),
         "lead_names": [json.dumps(PTBXL_LEADS)] * len(df),
+        "label_or_event": df["label_codes"].apply(json.dumps),
         "labels": df["label_codes"].apply(json.dumps),
         "label_scores": df["label_scores"],
         "strat_fold": df["strat_fold"].astype("Int64"),
         "split": df["strat_fold"].apply(lambda x: assign_split(int(x), ecg_cfg["splits"])),
         "cv_fold": df["strat_fold"].apply(lambda x: assign_cv_fold(int(x), ecg_cfg["splits"])),
+        "qc_flags": [normalize_qc_flags([])] * len(df),
     })
-
+    out.insert(
+        0,
+        "sample_id",
+        [
+            make_sample_id("ptbxl", "ecg", pid, rid, split, i)
+            for i, (pid, rid, split) in enumerate(
+                zip(out["subject_or_patient_id"], out["source_record_id"], out["split"])
+            )
+        ],
+    )
     out = out[out["split"] != "unused"].reset_index(drop=True)
     return out
 
@@ -183,15 +292,26 @@ def parse_all_ptbxl(raw_root: Path, out_root: Path, cfg: dict) -> dict:
     meta_df.to_parquet(out_path, index=False)
 
     summary = {
-        "dataset": "ptbxl",
+        "dataset_name": "ptbxl",
+        "modality": "ecg",
         "stage": "parse",
         "sampling_rate_hz": int(ecg_cfg["sampling_rate_hz"]),
         "n_records": int(len(meta_df)),
-        "n_patients": int(meta_df["patient_id"].nunique()),
+        "n_patients": int(meta_df["subject_or_patient_id"].nunique()),
         "n_train": int((meta_df["split"] == "train").sum()),
         "n_val": int((meta_df["split"] == "val").sum()),
         "n_test": int((meta_df["split"] == "test").sum()),
-        "output": str(out_path),
+        "artifacts": [
+            summarize_artifact(
+                out_path,
+                artifact_kind="parsed_metadata_parquet",
+                dataset_name="ptbxl",
+                modality="ecg",
+                stage="parse",
+                n_samples=int(len(meta_df)),
+                extra={"channel_schema": normalize_channel_schema(PTBXL_LEADS)},
+            )
+        ],
     }
 
     write_json(parsed_root / "summary.json", summary)
@@ -255,7 +375,7 @@ def clean_ptbxl_record(
     row: pd.Series,
     ecg_cfg: dict,
 ) -> tuple[np.ndarray, dict]:
-    values, lead_names = load_ptbxl_waveform(raw_root, row["source_file"])
+    values, lead_names = load_ptbxl_waveform(raw_root, row["source_file_or_record"])
     fs = int(row["sampling_rate_hz"])
 
     if values.ndim != 2:
@@ -271,22 +391,29 @@ def clean_ptbxl_record(
     )
     values = normalize_ecg(values, ecg_cfg["cleaning"]["normalize"])
 
-    meta = {
-        "dataset": row["dataset"],
-        "patient_id": int(row["patient_id"]),
-        "record_id": int(row["record_id"]),
-        "source_file": row["source_file"],
-        "sampling_rate_hz": int(fs),
-        "lead_names": json.dumps(lead_names),
-        "labels": row["labels"],
-        "label_scores": row["label_scores"],
-        "strat_fold": int(row["strat_fold"]),
-        "split": row["split"],
-        "cv_fold": None if pd.isna(row["cv_fold"]) else int(row["cv_fold"]),
-        "n_samples": int(values.shape[0]),
-        "n_leads": int(values.shape[1]),
-        "duration_sec": float(values.shape[0] / fs),
-    }
+    meta = finalize_metadata_row(
+        {
+            "sample_id": row["sample_id"],
+            "dataset_name": row["dataset_name"],
+            "modality": "ecg",
+            "subject_or_patient_id": int(row["subject_or_patient_id"]),
+            "source_file_or_record": row["source_file_or_record"],
+            "source_record_id": int(row["source_record_id"]),
+            "split": row["split"],
+            "label_or_event": row["label_or_event"],
+            "sampling_rate_hz": int(fs),
+            "n_channels": int(values.shape[1]),
+            "n_samples": int(values.shape[0]),
+            "channel_schema": normalize_channel_schema(lead_names),
+            "qc_flags": normalize_qc_flags([]),
+            "lead_names": json.dumps(lead_names),
+            "labels": row["labels"],
+            "label_scores": row["label_scores"],
+            "strat_fold": int(row["strat_fold"]),
+            "cv_fold": None if pd.isna(row["cv_fold"]) else int(row["cv_fold"]),
+            "duration_sec": float(values.shape[0] / fs),
+        }
+    )
     return values, meta
 
 
@@ -317,9 +444,9 @@ def clean_all_ecg_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root:
         except Exception as e:
             failures.append(
                 {
-                    "record_id": int(row["record_id"]),
-                    "patient_id": int(row["patient_id"]),
-                    "source_file": row["source_file"],
+                    "source_record_id": int(row["source_record_id"]),
+                    "subject_or_patient_id": int(row["subject_or_patient_id"]),
+                    "source_file_or_record": row["source_file_or_record"],
                     "reason": str(e),
                 }
             )
@@ -339,14 +466,44 @@ def clean_all_ecg_dataset(dataset: str, cfg: dict, raw_root: Path, interim_root:
     pd.DataFrame(failures).to_parquet(rej_out, index=False)
 
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "ecg",
         "stage": "clean",
         "sampling_rate_hz": int(ecg_cfg["sampling_rate_hz"]),
         "n_records_in": int(len(parsed_df)),
         "n_records_out": int(len(cleaned_meta_df)),
         "n_rejected": int(len(failures)),
         "waveform_shape": [int(x) for x in X.shape],
-        "outputs": [str(npy_out), str(meta_out), str(rej_out)],
+        "artifacts": [
+            summarize_artifact(
+                npy_out,
+                artifact_kind="cleaned_waveforms_npy",
+                dataset_name=dataset,
+                modality="ecg",
+                stage="clean",
+                n_samples=int(X.shape[0]),
+                array_shape=list(X.shape),
+                dtype=X.dtype,
+                extra={"channel_schema": normalize_channel_schema(PTBXL_LEADS)},
+            ),
+            summarize_artifact(
+                meta_out,
+                artifact_kind="cleaned_metadata_parquet",
+                dataset_name=dataset,
+                modality="ecg",
+                stage="clean",
+                n_samples=int(len(cleaned_meta_df)),
+                extra={"channel_schema": normalize_channel_schema(PTBXL_LEADS)},
+            ),
+            summarize_artifact(
+                rej_out,
+                artifact_kind="rejections_parquet",
+                dataset_name=dataset,
+                modality="ecg",
+                stage="clean",
+                n_samples=int(len(failures)),
+            ),
+        ],
     }
 
     write_json(cleaned_root / "summary.json", summary)
@@ -402,10 +559,11 @@ def window_all_ecg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
     ensure_dir(supervised_root)
 
     summary = {
-        "dataset": dataset,
+        "dataset_name": dataset,
+        "modality": "ecg",
         "stage": "window",
         "sampling_rate_hz": int(ecg_cfg["sampling_rate_hz"]),
-        "outputs": [],
+        "artifacts": [],
     }
 
     for split_name in ["train", "val", "test"]:
@@ -424,8 +582,18 @@ def window_all_ecg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             leads=np.array(PTBXL_LEADS, dtype=object),
             metadata=np.array(sub_df.to_dict(orient="records"), dtype=object),
         )
-        summary["outputs"].append(
-            {"file": str(out_path), "split": split_name, "n_records": int(X_sub.shape[0])}
+        summary["artifacts"].append(
+            summarize_artifact(
+                out_path,
+                artifact_kind="supervised_npz",
+                dataset_name=dataset,
+                modality="ecg",
+                stage="window",
+                n_samples=int(X_sub.shape[0]),
+                array_shape=list(X_sub.shape),
+                dtype=X_sub.dtype,
+                extra={"split": split_name, "channel_schema": normalize_channel_schema(PTBXL_LEADS)},
+            )
         )
 
     for cv_fold in range(len(ecg_cfg["splits"]["train_folds"])):
@@ -444,8 +612,22 @@ def window_all_ecg_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             leads=np.array(PTBXL_LEADS, dtype=object),
             metadata=np.array(sub_df.to_dict(orient="records"), dtype=object),
         )
-        summary["outputs"].append(
-            {"file": str(out_path), "split": "train", "cv_fold": int(cv_fold), "n_records": int(X_sub.shape[0])}
+        summary["artifacts"].append(
+            summarize_artifact(
+                out_path,
+                artifact_kind="supervised_npz",
+                dataset_name=dataset,
+                modality="ecg",
+                stage="window",
+                n_samples=int(X_sub.shape[0]),
+                array_shape=list(X_sub.shape),
+                dtype=X_sub.dtype,
+                extra={
+                    "split": "train",
+                    "cv_fold": int(cv_fold),
+                    "channel_schema": normalize_channel_schema(PTBXL_LEADS),
+                },
+            )
         )
 
     write_json(processed_root / "ecg" / f"{dataset}_window_summary.json", summary)
