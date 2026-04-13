@@ -45,6 +45,14 @@ python3 preprocess_har.py --dataset wisdm --stage clean
 python3 preprocess_har.py --dataset wisdm --stage window
 ```
 
+### mHealth (BONUS)
+
+```bash
+python3 preprocess_har.py --dataset mhealth --stage parse
+python3 preprocess_har.py --dataset mhealth --stage clean
+python3 preprocess_har.py --dataset mhealth --stage window
+```
+
 ---
 
 ## EEG preprocessing (EEGMMIDB)
