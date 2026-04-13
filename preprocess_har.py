@@ -87,6 +87,7 @@ PAMAP2_ACTIVITY_MAP = {
 
 HAR_CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 
+
 DEFAULT_HAR_CFG = {
     "target_sampling_hz": 20,
     "cleaning": {
@@ -106,6 +107,58 @@ DEFAULT_HAR_CFG = {
         },
     },
 }
+
+# Label policy helper for HAR datasets
+def get_har_label_policy(dataset: str) -> dict:
+    base = {
+        "policy_version": "1.0",
+        "summary_level_only": True,
+        "notes": "Dataset-level manifest describing how null/transient/background labels are preserved or excluded across HAR stages.",
+    }
+
+    if dataset == "pamap2":
+        return {
+            **base,
+            "dataset": "pamap2",
+            "raw_special_labels": {
+                "0": {
+                    "name": "transient",
+                    "meaning": "transition / non-steady activity segment",
+                    "parse": "preserved in parsed and cleaned outputs as raw_label_name='transient'",
+                    "pretrain_windowing": "implicitly allowed because pretrain windows are unlabeled",
+                    "supervised_windowing": "excluded whenever transient dominates or prevents reaching min_label_purity",
+                }
+            },
+        }
+
+    if dataset == "mhealth":
+        return {
+            **base,
+            "dataset": "mhealth",
+            "raw_special_labels": {
+                "0": {
+                    "name": "null",
+                    "meaning": "background / non-target class",
+                    "parse": "preserved in parsed and cleaned outputs as raw_label_name='null'",
+                    "pretrain_windowing": "implicitly allowed because pretrain windows are unlabeled",
+                    "supervised_windowing": "excluded whenever null dominates or prevents reaching min_label_purity",
+                }
+            },
+        }
+
+    if dataset == "wisdm":
+        return {
+            **base,
+            "dataset": "wisdm",
+            "raw_special_labels": {},
+            "notes": "No explicit null/transient class is defined in the WISDM watch labels used here.",
+        }
+
+    return {
+        **base,
+        "dataset": dataset,
+        "raw_special_labels": {},
+    }
 
 
 CANONICAL_META_COLUMNS = [
@@ -673,6 +726,7 @@ def parse_all_pamap2(raw_root: Path, out_root: Path) -> dict:
     summary = {
         "dataset": "pamap2",
         "selection": "protocol_only",
+        "label_policy": get_har_label_policy("pamap2"),
         "n_files_discovered": len(all_dat_files),
         "n_files": 0,
         "n_rows_total": 0,
@@ -729,6 +783,7 @@ def parse_all_wisdm(raw_root: Path, out_root: Path) -> dict:
     summary = {
         "dataset": "wisdm",
         "selection": "watch_txt_only",
+        "label_policy": get_har_label_policy("wisdm"),
         "n_watch_accel_files": len(sensor_files["watch_accel"]),
         "n_watch_gyro_files": len(sensor_files["watch_gyro"]),
         "n_pairs": len(pairs),
@@ -770,6 +825,7 @@ def clean_all_har_dataset(dataset: str, cfg: dict, interim_root: Path) -> dict:
         "dataset_name": dataset,
         "modality": "har",
         "stage": "clean_resample",
+        "label_policy": get_har_label_policy(dataset),
         "sampling_rate_hz": har_cfg["target_sampling_hz"],
         "channel_schema": normalize_channel_schema(HAR_CHANNELS),
         "n_inputs": len(parsed_files),
@@ -830,6 +886,7 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
         "dataset_name": dataset,
         "modality": "har",
         "stage": "window",
+        "label_policy": get_har_label_policy(dataset),
         "sampling_rate_hz": har_cfg["target_sampling_hz"],
         "channel_schema": normalize_channel_schema(HAR_CHANNELS),
         "n_inputs": len(cleaned_files),
@@ -853,6 +910,7 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             X=X_pre,
             channels=np.array(HAR_CHANNELS, dtype=object),
             metadata=np.array(meta_pre, dtype=object),
+            label_policy=np.array(get_har_label_policy(dataset), dtype=object),
         )
         summary["artifacts"].append(
             summarize_artifact(
@@ -885,6 +943,7 @@ def window_all_har_dataset(dataset: str, cfg: dict, interim_root: Path, processe
             X=X_sup,
             channels=np.array(HAR_CHANNELS, dtype=object),
             metadata=np.array(meta_sup, dtype=object),
+            label_policy=np.array(get_har_label_policy(dataset), dtype=object),
         )
         summary["artifacts"].append(
             summarize_artifact(
@@ -993,13 +1052,9 @@ def parse_all_mhealth(raw_root: Path, out_root: Path) -> dict:
     summary = {
         "dataset": "mhealth",
         "selection": "subject_logs_only",
+        "label_policy": get_har_label_policy("mhealth"),
         "source_sampling_hz": 50,
         "shared_sensor_proxy": "right_lower_arm",
-        "null_label_mapping": {
-            "raw_label": 0,
-            "mapped_label_name": "null",
-            "meaning": "background / non-target class kept explicitly documented in parsed outputs",
-        },
         "n_files": 0,
         "n_rows_total": 0,
         "outputs": [],

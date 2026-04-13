@@ -293,17 +293,22 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
 
     pamap_pretrain_root = har_root / "pretrain" / "pamap2"
     wisdm_pretrain_root = har_root / "pretrain" / "wisdm"
+    mhealth_pretrain_root = har_root / "pretrain" / "mhealth"
     pamap_supervised_root = har_root / "supervised" / "pamap2"
     wisdm_supervised_root = har_root / "supervised" / "wisdm"
+    mhealth_supervised_root = har_root / "supervised" / "mhealth"
 
     pamap_pretrain_files = list_npz_files(pamap_pretrain_root)
     wisdm_pretrain_files = list_npz_files(wisdm_pretrain_root)
+    mhealth_pretrain_files = list_npz_files(mhealth_pretrain_root)
     pamap_supervised_files = list_npz_files(pamap_supervised_root)
     wisdm_supervised_files = list_npz_files(wisdm_supervised_root)
+    mhealth_supervised_files = list_npz_files(mhealth_supervised_root)
 
     pamap_files = pamap_pretrain_files + pamap_supervised_files
     wisdm_files = wisdm_pretrain_files + wisdm_supervised_files
-    har_files = pamap_files + wisdm_files
+    mhealth_files = mhealth_pretrain_files + mhealth_supervised_files
+    har_files = pamap_files + wisdm_files + mhealth_files
 
     if not har_files:
         return [CheckResult(
@@ -320,12 +325,18 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
         har_root / "wisdm_window_summary.json",
         Path("data/interim/har/wisdm/cleaned/summary.json"),
     ])
+    mhealth_summary_path = first_existing([
+        har_root / "mhealth_window_summary.json",
+        Path("data/interim/har/mhealth/cleaned/summary.json"),
+    ])
 
     summaries = {}
     if pamap_summary_path is not None:
         summaries["pamap2"] = safe_load_json(pamap_summary_path)
     if wisdm_summary_path is not None:
         summaries["wisdm"] = safe_load_json(wisdm_summary_path)
+    if mhealth_summary_path is not None:
+        summaries["mhealth"] = safe_load_json(mhealth_summary_path)
 
     window_shapes = Counter()
     nan_files = []
@@ -337,17 +348,22 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
         "pamap2_supervised": len(pamap_supervised_files),
         "wisdm_pretrain": len(wisdm_pretrain_files),
         "wisdm_supervised": len(wisdm_supervised_files),
+        "mhealth_pretrain": len(mhealth_pretrain_files),
+        "mhealth_supervised": len(mhealth_supervised_files),
     }
 
     pamap_subject_ids = set()
     wisdm_subject_ids = set()
+    mhealth_subject_ids = set()
 
-    for dataset_name, files in (("pamap2", pamap_files), ("wisdm", wisdm_files)):
+    for dataset_name, files in (("pamap2", pamap_files), ("wisdm", wisdm_files), ("mhealth", mhealth_files)):
         for f in files:
             if dataset_name == "pamap2":
                 pamap_subject_ids.add(f.stem)
-            else:
+            elif dataset_name == "wisdm":
                 wisdm_subject_ids.add(f.stem)
+            else:
+                mhealth_subject_ids.add(f.stem)
 
             data = load_npz_dict(f)
             arr = None
@@ -388,8 +404,9 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
 
     pamap_summary = summaries.get("pamap2", {})
     wisdm_summary = summaries.get("wisdm", {})
+    mhealth_summary = summaries.get("mhealth", {})
 
-    for dataset_name, summary in (("pamap2", pamap_summary), ("wisdm", wisdm_summary)):
+    for dataset_name, summary in (("pamap2", pamap_summary), ("wisdm", wisdm_summary), ("mhealth", mhealth_summary)):
         if not summary:
             continue
         sampling_rates[dataset_name] = summary.get("sampling_rate_hz", summary.get("target_hz"))
@@ -399,7 +416,9 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
             channel_schemas[dataset_name] = maybe_json_list(summary.get("channel_schema"))
         elif "channels" in summary:
             channel_schemas[dataset_name] = maybe_json_list(summary.get("channels"))
-        if "null_label_policy" in summary:
+        if "label_policy" in summary:
+            label_policy[dataset_name] = summary.get("label_policy")
+        elif "null_label_policy" in summary:
             label_policy[dataset_name] = summary.get("null_label_policy")
         elif "label_zero_policy" in summary:
             label_policy[dataset_name] = summary.get("label_zero_policy")
@@ -423,8 +442,10 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
     harmonisation_ok = (
         sampling_rates.get("pamap2") == EXPECTED_HAR_SR
         and sampling_rates.get("wisdm") == EXPECTED_HAR_SR
+        and sampling_rates.get("mhealth") == EXPECTED_HAR_SR
         and channel_schemas.get("pamap2") == EXPECTED_HAR_CHANNELS
         and channel_schemas.get("wisdm") == EXPECTED_HAR_CHANNELS
+        and channel_schemas.get("mhealth") == EXPECTED_HAR_CHANNELS
     )
 
     results.append(CheckResult(
@@ -432,10 +453,12 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
         passed=harmonisation_ok,
         details=(
             f"PAMAP2 pretrain/supervised files: {len(pamap_pretrain_files)}/{len(pamap_supervised_files)}, "
-            f"WISDM pretrain/supervised files: {len(wisdm_pretrain_files)}/{len(wisdm_supervised_files)}. "
+            f"WISDM pretrain/supervised files: {len(wisdm_pretrain_files)}/{len(wisdm_supervised_files)}, "
+            f"mHealth pretrain/supervised files: {len(mhealth_pretrain_files)}/{len(mhealth_supervised_files)}. "
             f"Sampling rates: {sampling_rates}. "
             f"Summary sources: pamap2={str(pamap_summary_path) if pamap_summary_path is not None else 'missing'}, "
-            f"wisdm={str(wisdm_summary_path) if wisdm_summary_path is not None else 'missing'}."
+            f"wisdm={str(wisdm_summary_path) if wisdm_summary_path is not None else 'missing'}, "
+            f"mhealth={str(mhealth_summary_path) if mhealth_summary_path is not None else 'missing'}."
         ),
         stats={
             "sampling_rates": sampling_rates,
@@ -479,16 +502,17 @@ def check_har_outputs(processed_root: Path) -> List[CheckResult]:
         },
     ))
 
-    leakage_ok = bool(pamap_subject_ids) and bool(wisdm_subject_ids)
+    leakage_ok = bool(pamap_subject_ids) and bool(wisdm_subject_ids) and bool(mhealth_subject_ids)
     results.append(CheckResult(
         name="Leakage control",
         passed=leakage_ok,
         details=(
-            f"HAR outputs detected: {len(pamap_files)} PAMAP2 files and {len(wisdm_files)} WISDM files across pretrain and supervised outputs."
+            f"HAR outputs detected: {len(pamap_files)} PAMAP2 files, {len(wisdm_files)} WISDM files, and {len(mhealth_files)} mHealth files across pretrain and supervised outputs."
         ),
         stats={
             "pamap2_subjects_or_files": len(pamap_subject_ids),
             "wisdm_subjects_or_files": len(wisdm_subject_ids),
+            "mhealth_subjects_or_files": len(mhealth_subject_ids),
         },
     ))
 
